@@ -119,6 +119,14 @@ func (sm *Summary) marshalTo(prefix string, w io.Writer) {
 	}
 }
 
+func splitMetricNameGraphite(name string) (string, string) {
+	n := strings.IndexByte(name, ';')
+	if n < 0 {
+		return name, ""
+	}
+	return name[:n], name[n:]
+}
+
 func splitMetricName(name string) (string, string) {
 	n := strings.IndexByte(name, '{')
 	if n < 0 {
@@ -201,6 +209,10 @@ func addTag(name, tag string) string {
 		return fmt.Sprintf("%s{%s}", name, tag)
 	}
 	return fmt.Sprintf("%s,%s}", name[:len(name)-1], tag)
+}
+
+func addTagGraphite(name, tag string) string {
+	return fmt.Sprintf("%s;%s", name, tag)
 }
 
 func registerSummaryLocked(sm *Summary) {

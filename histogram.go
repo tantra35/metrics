@@ -1,6 +1,7 @@
 package metrics
 
 import (
+	"encoding/binary"
 	"fmt"
 	"io"
 	"math"
@@ -138,6 +139,33 @@ func (h *Histogram) VisitNonZeroBuckets(f func(vmrange string, count uint64)) {
 	h.mu.Unlock()
 }
 
+func (h *Histogram) Merge(m *Histogram) {
+	h.mu.Lock()
+	if h.lower > m.lower {
+		h.lower = m.lower
+	}
+	for decimalBucketIdx, db := range m.decimalBuckets[:] {
+		if db == nil {
+			continue
+		}
+		if h.decimalBuckets[decimalBucketIdx] == nil {
+			h.decimalBuckets[decimalBucketIdx] = db
+		} else {
+			for offset, count := range db[:] {
+				if count > 0 {
+					h.decimalBuckets[decimalBucketIdx][offset] += count
+				}
+			}
+		}
+	}
+	if h.upper < m.upper {
+		h.upper = m.upper
+	}
+
+	h.sum += m.sum
+	h.mu.Unlock()
+}
+
 // NewHistogram creates and returns new histogram with the given name.
 //
 // name must be valid Prometheus-compatible metric with possible labels.
@@ -199,6 +227,102 @@ var (
 	bucketRanges     [bucketsCount]string
 	bucketRangesOnce sync.Once
 )
+
+func (h *Histogram) Deserialize(in io.Reader) error {
+	h.Reset()
+
+	var sum float64
+	if err := binary.Read(in, binary.BigEndian, &sum); err != nil {
+		return fmt.Errorf("read: %w", err)
+	}
+	h.sum = sum
+
+	var nbin int16
+	if err := binary.Read(in, binary.BigEndian, &nbin); err != nil {
+		return fmt.Errorf("read: %w", err)
+	}
+
+	for i := 0; i < int(nbin); i++ {
+		var decimalBucketIdx int16
+		if err := binary.Read(in, binary.BigEndian, &decimalBucketIdx); err != nil {
+			return fmt.Errorf("read: %w", err)
+		}
+
+		var b [bucketsPerDecimal]uint64
+		h.decimalBuckets[decimalBucketIdx] = &b
+
+		for j := 0; j < bucketsPerDecimal; j++ {
+			var count uint64
+			if err := binary.Read(in, binary.BigEndian, &count); err != nil {
+				return fmt.Errorf("read: %w", err)
+			}
+
+			b[j] = count
+		}
+	}
+
+	return nil
+}
+
+func (h *Histogram) Serialize(w io.Writer) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	if err := binary.Write(w, binary.BigEndian, h.sum); err != nil {
+		return fmt.Errorf("write: %w", err)
+	}
+
+	var nbin int16
+	for _, db := range h.decimalBuckets[:] {
+		if db != nil {
+			nbin += 1
+		}
+	}
+	if err := binary.Write(w, binary.BigEndian, nbin); err != nil {
+		return fmt.Errorf("write: %w", err)
+	}
+	for decimalBucketIdx, db := range h.decimalBuckets[:] {
+		if db == nil {
+			continue
+		}
+		if err := binary.Write(w, binary.BigEndian, int16(decimalBucketIdx)); err != nil {
+			return fmt.Errorf("write: %w", err)
+		}
+		for _, count := range db[:] {
+			if err := binary.Write(w, binary.BigEndian, count); err != nil {
+				return fmt.Errorf("write: %w", err)
+			}
+		}
+	}
+
+	return nil
+}
+
+func (h *Histogram) MarshalToGraphite(prefix string, w io.Writer) {
+	countTotal := uint64(0)
+	h.VisitNonZeroBuckets(func(vmrange string, count uint64) {
+		tag := fmt.Sprintf("vmrange=%s", vmrange)
+		metricName := addTagGraphite(prefix, tag)
+		name, labels := splitMetricNameGraphite(metricName)
+		fmt.Fprintf(w, "%s_bucket%s %d\n", name, labels, count)
+		countTotal += count
+	})
+	if countTotal == 0 {
+		return
+	}
+	name, labels := splitMetricNameGraphite(prefix)
+	sum := h.getSum()
+	if float64(int64(sum)) == sum {
+		fmt.Fprintf(w, "%s_sum%s %d\n", name, labels, int64(sum))
+	} else {
+		fmt.Fprintf(w, "%s_sum%s %g\n", name, labels, sum)
+	}
+	fmt.Fprintf(w, "%s_count%s %d\n", name, labels, countTotal)
+}
+
+func (h *Histogram) MarshalTo(prefix string, w io.Writer) {
+	h.marshalTo(prefix, w)
+}
 
 func (h *Histogram) marshalTo(prefix string, w io.Writer) {
 	countTotal := uint64(0)
